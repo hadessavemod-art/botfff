@@ -18,7 +18,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup,
-    InputMediaPhoto, Message
+    InputMediaPhoto, Message, ReplyKeyboardMarkup, KeyboardButton, ErrorEvent
 )
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 
@@ -44,7 +44,7 @@ ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", "8754872846"))
 
 # Used only for the manual Telegram Stars flow.
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@chlenMixi")
-CHANNEL_ID = os.getenv("CHANNEL_ID", "@channel")
+CHANNEL_ID = os.getenv("CHANNEL_ID", "-1004371944515")
 CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/+ZU25gLDwviYzZmY1")
 
 # Bothost preserves /app/data between container restarts/deployments.
@@ -340,6 +340,17 @@ async def subscription_required(user_id: int) -> bool:
             ChatMemberStatus.ADMINISTRATOR,
             ChatMemberStatus.CREATOR,
         }
+    except TelegramBadRequest as e:
+        error_text = str(e)
+        if "member list is inaccessible" in error_text.lower():
+            logger.warning(
+                "Subscription check unavailable: the bot must be an administrator "
+                "of the private channel %s. Add the bot as an admin and restart the bot.",
+                channel_id,
+            )
+        else:
+            logger.warning("Subscription check failed: %s", e)
+        return False
     except Exception as e:
         logger.warning("Subscription check failed: %s", e)
         return False
@@ -359,16 +370,21 @@ async def require_subscription_message(message):
 
 
 async def main_menu():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text=await db.setting("btn_categories"), callback_data="categories")
+    # Main menu is a persistent Telegram reply keyboard below the input field.
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text=await db.setting("btn_categories")),
+                KeyboardButton(text=await db.setting("btn_purchases")),
+            ],
+            [
+                KeyboardButton(text=await db.setting("btn_free")),
+                KeyboardButton(text=await db.setting("btn_help")),
+            ],
         ],
-        [
-            InlineKeyboardButton(text=await db.setting("btn_purchases"), callback_data="my_purchases"),
-            InlineKeyboardButton(text=await db.setting("btn_free"), callback_data="free"),
-        ],
-        [InlineKeyboardButton(text=await db.setting("btn_help"), callback_data="help")],
-    ])
+        resize_keyboard=True,
+        is_persistent=True,
+    )
 
 
 async def send_main_menu(message):
@@ -526,6 +542,68 @@ async def start(message: Message, state: FSMContext):
             return
 
     await send_main_menu(message)
+
+
+@router.message(F.text.in_({"Категории", "Мои покупки", "Бесплатное видео", "Помощь"}))
+async def main_menu_button(message: Message, state: FSMContext):
+    # These are the four default labels stored in settings.
+    # Do not intercept admin FSM input while an admin is entering data.
+    if await state.get_state() is not None:
+        return
+    await ensure_user(message.from_user)
+
+    if await is_blocked(message.from_user.id) and not is_admin(message.from_user.id):
+        await message.answer("Доступ к боту ограничен.")
+        return
+
+    if not is_admin(message.from_user.id) and not await subscription_required(message.from_user.id):
+        await require_subscription_message(message)
+        return
+
+    button = message.text
+    if button == await db.setting("btn_categories", "Категории"):
+        text = "Выберите категорию:"
+        photo = await db.setting("category_photo") or await db.setting("main_photo")
+        kb = await categories_keyboard()
+        if photo:
+            try:
+                await message.answer_photo(photo, caption=text, reply_markup=kb)
+                return
+            except Exception:
+                pass
+        await message.answer(text, reply_markup=kb)
+        return
+
+    if button == await db.setting("btn_purchases", "Мои покупки"):
+        rows = await db.fetchall(
+            "SELECT p.*, c.name FROM purchases p JOIN categories c ON c.id=p.category_id "
+            "WHERE p.user_id=? ORDER BY p.id DESC LIMIT 20",
+            (message.from_user.id,),
+        )
+        if not rows:
+            text = "У вас пока нет покупок."
+        else:
+            parts = ["<b>Мои покупки</b>\n"]
+            for purchase in rows:
+                parts.append(
+                    f"#{purchase['id']} · {escape(purchase['name'])} · "
+                    f"{purchase['payment_method']} · {purchase['status']}"
+                )
+            text = "\n".join(parts)
+        await message.answer(text)
+        return
+
+    if button == await db.setting("btn_free", "Бесплатное видео"):
+        cats = await db.fetchall("SELECT * FROM categories WHERE is_free=1 AND enabled=1")
+        if not cats:
+            await message.answer("Сейчас бесплатных видео нет.")
+            return
+        rows = [[InlineKeyboardButton(text=c["name"], callback_data=f"freecat:{c['id']}")] for c in cats]
+        await message.answer("Бесплатные видео:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        return
+
+    if button == await db.setting("btn_help", "Помощь"):
+        await message.answer(await db.setting("help_text"))
 
 
 @router.callback_query(F.data == "sub_check")
@@ -842,7 +920,7 @@ async def stars_buy(callback: CallbackQuery):
         await callback.answer("Покупки за Stars временно отключены.", show_alert=True)
         return
 
-    admin_username = await db.setting("admin_username", ADMIN_USERNAME).lstrip("@")
+    admin_username = (await db.setting("admin_username", ADMIN_USERNAME)).lstrip("@")
     text = (
         "<b>Покупка за Stars</b>\n\n"
         f"Категория: {escape(c['name'])}\n"
@@ -1828,8 +1906,8 @@ async def send_stats_csv(message):
 # STARTUP / ERRORS
 # ============================================================
 
-async def error_handler(event, exception):
-    logger.exception("Unhandled update error", exc_info=exception)
+async def error_handler(event: ErrorEvent):
+    logger.exception("Unhandled update error", exc_info=event.exception)
     return True
 
 
