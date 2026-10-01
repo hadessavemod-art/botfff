@@ -18,7 +18,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup,
-    InputMediaPhoto, Message, ReplyKeyboardMarkup, KeyboardButton, ErrorEvent
+    InputMediaPhoto, Message, ReplyKeyboardMarkup, KeyboardButton
 )
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 
@@ -1906,11 +1906,6 @@ async def send_stats_csv(message):
 # STARTUP / ERRORS
 # ============================================================
 
-async def error_handler(event: ErrorEvent):
-    logger.exception("Unhandled update error", exc_info=event.exception)
-    return True
-
-
 async def main():
     global bot
     if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN":
@@ -1924,7 +1919,6 @@ async def main():
     )
     dp = Dispatcher()
     dp.include_router(router)
-    dp.errors.register(error_handler)
 
     logger.info("Bot started: %s", await db.setting("bot_name", BOT_NAME))
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
